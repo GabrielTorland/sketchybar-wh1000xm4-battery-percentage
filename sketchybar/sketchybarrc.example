@@ -5,6 +5,8 @@
 #     cp headphone_battery.sh ~/.config/sketchybar/plugins/
 #     chmod +x ~/.config/sketchybar/plugins/headphone_battery.sh
 
+# The icon is the SF Symbols "headphones" glyph, U+100448. It only renders in
+# the system font, so it may look like a blank box in a browser or editor.
 sketchybar --add item headphone_battery right \
            --set headphone_battery \
                  update_freq=60 \

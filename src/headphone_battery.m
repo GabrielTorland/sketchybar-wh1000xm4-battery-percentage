@@ -31,6 +31,9 @@
 #import <Foundation/Foundation.h>
 #import <IOBluetooth/IOBluetooth.h>
 #import <CoreAudio/CoreAudio.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#include <time.h>
 
 static const uint8_t START_MARKER  = 0x3E;
 static const uint8_t END_MARKER    = 0x3C;
@@ -68,6 +71,11 @@ static NSString *const SERVICE_UUID_V1 = @"96CC203E506846ADB32DE316F5E069BA";
 static NSString *const SERVICE_UUID_V2 = @"956C7B26D49A4BA8B03FB17D393CB6E2";
 
 static const NSTimeInterval RETRY_EVERY = 0.5;
+
+// A failed read is usually a passing Bluetooth hiccup rather than a headset
+// that has gone away, so an existing reading is kept rather than erased. It is
+// only given up on once it is old enough to be misleading.
+static const NSTimeInterval STALE_AFTER = 30 * 60;
 
 typedef NS_ENUM(int, ExitCode) {
     EXIT_OK             = 0,
@@ -156,10 +164,16 @@ static NSData *MDRFrame(uint8_t type, uint8_t seq, NSData *payload) {
 }
 
 - (void)rfcommChannelOpenComplete:(IOBluetoothRFCOMMChannel *)ch status:(IOReturn)error {
+    if (verbose) fprintf(stderr, "open complete: 0x%08X\n", error);
     if (error != kIOReturnSuccess) { self.done = YES; return; }
     self.channel = ch;
     uint8_t hello[2] = { CMD_GET_PROTOCOL, 0x00 };
     [self sendData:[NSData dataWithBytes:hello length:2]];
+}
+
+- (void)rfcommChannelClosed:(IOBluetoothRFCOMMChannel *)ch {
+    if (verbose) fprintf(stderr, "channel closed by peer\n");
+    self.done = YES;
 }
 
 - (void)rfcommChannelData:(IOBluetoothRFCOMMChannel *)ch data:(void *)data length:(size_t)len {
@@ -286,6 +300,15 @@ static BluetoothRFCOMMChannelID ControlChannel(IOBluetoothDevice *dev) {
     return cid;
 }
 
+
+// True when the file already holds a reading recent enough to go on showing.
+static BOOL FreshReadingExists(NSString *path) {
+    struct stat st;
+    if (stat(path.UTF8String, &st) != 0) return NO;
+    if (st.st_size == 0) return NO;
+    return (time(NULL) - st.st_mtime) < (time_t)STALE_AFTER;
+}
+
 static void usage(void) {
     fprintf(stderr,
         "usage: headphone-battery [options]\n"
@@ -317,13 +340,12 @@ static void usage(void) {
 // notably when the process is not permitted to use it, where CoreBluetooth
 // waits forever rather than failing. The run loop deadline cannot help there,
 // so the timeout is also armed as a signal.
-static char alarmOutputPath[PATH_MAX];
-
 static void OnAlarm(int sig) {
     (void)sig;
-    // Leaving a stale reading behind would be worse than leaving none, and
-    // unlink is one of the few things safe to call from a signal handler.
-    if (alarmOutputPath[0]) unlink(alarmOutputPath);
+    // A hang is treated like any other failed read: the previous reading is
+    // left alone, because a headset that is still being listened through has
+    // not stopped having a battery just because one attempt jammed. The sweep
+    // at startup is what eventually clears a reading that stopped being true.
     _exit(EXIT_NO_REPLY);
 }
 
@@ -364,13 +386,27 @@ int main(int argc, const char *argv[]) {
 
         // Generous relative to the run loop deadline: this is the last resort
         // for a call that never returns, not the normal way to give up.
-        if (output) strlcpy(alarmOutputPath, output.UTF8String, sizeof(alarmOutputPath));
+        // Clear a reading that has aged out before doing anything that might
+        // hang, so that even a permanently unreachable headset stops being
+        // reported rather than freezing at its last known level.
+        if (output && !FreshReadingExists(output)) {
+            struct stat st;
+            if (stat(output.UTF8String, &st) == 0 && st.st_size > 0) WriteAtomically(output, @"");
+        }
         signal(SIGALRM, OnAlarm);
         alarm((unsigned)(timeout * 2) + 5);
 
         // Nothing to report is reported as emptiness rather than silence, so a
         // reader can tell "not listening through these" from "never ran".
-        #define FAIL(code) do { if (output) WriteAtomically(output, @""); return (code); } while (0)
+        #define GONE(code) do { if (output) WriteAtomically(output, @""); return (code); } while (0)
+
+        // A read that fails while the headset is still the output device is a
+        // different thing from the headset being absent: erasing the reading
+        // would make the widget flicker away on every transient radio problem.
+        #define UNREAD(code) do { \
+            if (output && !FreshReadingExists(output)) WriteAtomically(output, @""); \
+            return (code); \
+        } while (0)
 
         if (list) {
             for (IOBluetoothDevice *d in [IOBluetoothDevice pairedDevices]) {
@@ -386,7 +422,7 @@ int main(int argc, const char *argv[]) {
         // Default behaviour: whatever you are listening through right now.
         if (!wanted && !any) {
             wanted = DefaultOutputDeviceName();
-            if (!wanted) FAIL(EXIT_NO_DEVICE);
+            if (!wanted) GONE(EXIT_NO_DEVICE);
         }
 
         NSMutableArray<IOBluetoothDevice *> *candidates = [NSMutableArray array];
@@ -396,7 +432,7 @@ int main(int argc, const char *argv[]) {
             if (wanted && [nm rangeOfString:wanted].location == NSNotFound) continue;
             [candidates addObject:d];
         }
-        if (candidates.count == 0) FAIL(EXIT_NO_DEVICE);
+        if (candidates.count == 0) GONE(EXIT_NO_DEVICE);
 
         int lastError = EXIT_NO_DEVICE;
         for (IOBluetoothDevice *dev in candidates) {
@@ -405,7 +441,11 @@ int main(int argc, const char *argv[]) {
 
             MDRClient *client = [[MDRClient alloc] init];
             IOBluetoothRFCOMMChannel *ch = nil;
-            if ([dev openRFCOMMChannelAsync:&ch withChannelID:cid delegate:client] != kIOReturnSuccess) {
+            if (verbose) fprintf(stderr, "opening %s channel %d\n",
+                                 ([dev name] ?: @"?").UTF8String, cid);
+            IOReturn rc = [dev openRFCOMMChannelAsync:&ch withChannelID:cid delegate:client];
+            if (verbose) fprintf(stderr, "open call returned: 0x%08X\n", rc);
+            if (rc != kIOReturnSuccess) {
                 lastError = EXIT_NO_CHANNEL;
                 continue;
             }
@@ -439,7 +479,7 @@ int main(int argc, const char *argv[]) {
             }
             return EXIT_OK;
         }
-        FAIL(lastError);
+        UNREAD(lastError);
         #undef FAIL
     }
 }

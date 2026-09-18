@@ -24,8 +24,11 @@ local config = {
 
   position = "right",
   update_freq = 60, -- how often to re-read the file, not the headphones
+  padding = 5, -- side padding, restored when the item is shown again
 
-  icon = "􀑈", -- SF Symbols "headphones" (U+100448)
+  -- SF Symbols "headphones". Written as an escape because the glyph itself
+  -- only renders in the system font, and shows as a blank box everywhere else.
+  icon = "\u{100448}",
   icon_size = 14.0,
   font = "SF Pro",
   numbers_font = "SF Mono",
@@ -66,9 +69,14 @@ local headphone_battery = sbar.add("item", "headphone_battery", {
 -- Collapsing to zero width rather than hiding the item outright is deliberate:
 -- sketchybar stops running the update script of an item whose drawing is off,
 -- so an item hidden that way would never notice the headphones coming back.
+-- Zeroing the paddings matters as much as the width: an item keeps its own
+-- padding either side of whatever it draws, so a merely zero-width one still
+-- pushes a surrounding bracket out past its contents and into its neighbour.
 local function collapse()
   headphone_battery:set({
     width = 0,
+    padding_left = 0,
+    padding_right = 0,
     icon = { drawing = false },
     label = { drawing = false },
     background = { drawing = false },
@@ -102,14 +110,19 @@ local function apply(result)
 
   headphone_battery:set({
     width = "dynamic",
+    padding_left = config.padding,
+    padding_right = config.padding,
     icon = { drawing = true, color = color },
     label = { drawing = true, string = percent .. "%", color = color },
     background = { drawing = config.background ~= nil },
   })
 end
 
+-- The trailing echo is load-bearing: sbar.exec does not call back on empty
+-- output, and empty is exactly what the file holds when there is nothing to
+-- show, so without it the widget could never learn to hide itself again.
 local function read_cache()
-  sbar.exec("cat " .. config.cache .. " 2>/dev/null", apply)
+  sbar.exec("cat " .. config.cache .. " 2>/dev/null; echo", apply)
 end
 
 -- Switching output device is the moment the answer changes, and waiting out
@@ -117,7 +130,7 @@ end
 -- ask it to run now and read the result once it has had time to land.
 local function refresh()
   sbar.exec("launchctl kickstart -k gui/$(id -u)/" .. config.agent
-            .. " >/dev/null 2>&1; sleep 3; cat " .. config.cache .. " 2>/dev/null", apply)
+            .. " >/dev/null 2>&1; sleep 3; cat " .. config.cache .. " 2>/dev/null; echo", apply)
 end
 
 headphone_battery:subscribe("routine", read_cache)

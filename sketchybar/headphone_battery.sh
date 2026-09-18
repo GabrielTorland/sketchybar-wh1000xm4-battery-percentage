@@ -13,6 +13,8 @@
 CACHE="${HEADPHONE_BATTERY_CACHE:-$HOME/.cache/headphone-battery.json}"
 AGENT="${HEADPHONE_BATTERY_AGENT:-io.github.gabrieltorland.headphone-battery}"
 
+PADDING=${HEADPHONE_BATTERY_PADDING:-5}
+
 LOW=${HEADPHONE_BATTERY_LOW:-20}
 WARN=${HEADPHONE_BATTERY_WARN:-35}
 
@@ -31,8 +33,13 @@ fi
 # Collapsing to zero width rather than turning drawing off is deliberate:
 # sketchybar stops running the update script of an item whose drawing is off,
 # so an item hidden that way would never notice the headphones coming back.
+# Zeroing the paddings matters as much as the width: an item keeps its own
+# padding either side of whatever it draws, so a merely zero-width one still
+# pushes a surrounding bracket out past its contents and into its neighbour.
 collapse() {
   sketchybar --set "$NAME" width=0 \
+                           padding_left=0 \
+                           padding_right=0 \
                            icon.drawing=off \
                            label.drawing=off \
                            background.drawing=off
@@ -58,6 +65,8 @@ elif [ "$PERCENT" -le "$WARN" ]; then
 fi
 
 sketchybar --set "$NAME" width=dynamic \
+                         padding_left="$PADDING" \
+                         padding_right="$PADDING" \
                          icon.drawing=on \
                          icon.color="$COLOR" \
                          label.drawing=on \
