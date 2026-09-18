@@ -1,0 +1,22 @@
+# Add this to your sketchybarrc.
+#
+# Copy headphone_battery.sh into your plugin directory and make it executable:
+#
+#     cp headphone_battery.sh ~/.config/sketchybar/plugins/
+#     chmod +x ~/.config/sketchybar/plugins/headphone_battery.sh
+
+sketchybar --add item headphone_battery right \
+           --set headphone_battery \
+                 update_freq=60 \
+                 script="$PLUGIN_DIR/headphone_battery.sh" \
+                 icon="􀑈" \
+                 icon.font="SF Pro:Regular:14.0" \
+                 icon.padding_left=8 \
+                 icon.padding_right=4 \
+                 label="--%" \
+                 label.font="SF Mono:Regular:12.0" \
+                 label.padding_right=8 \
+                 background.color=0xff363944 \
+                 background.corner_radius=5 \
+                 background.height=24 \
+           --subscribe headphone_battery volume_change system_woke
