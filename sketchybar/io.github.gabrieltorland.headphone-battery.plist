@@ -9,19 +9,32 @@
        script: Bluetooth is not available to processes sketchybar spawns, which
        fail silently, while a launchd agent is granted it normally. The agent
        writes the reading to a file and the widget only ever reads that file. -->
+  <!-- It stays running rather than being woken on a timer because the reading
+       changes the moment you switch what you are listening through, and macOS
+       says so immediately. Waiting out an interval to notice would mean the bar
+       is wrong for minutes at a time. --notify nudges sketchybar, but only when
+       the reading actually changed. -->
   <key>ProgramArguments</key>
   <array>
     <string>__PREFIX__/bin/headphone-battery</string>
+    <string>--watch</string>
     <string>--json</string>
     <string>--output</string>
     <string>__CACHE__</string>
+    <string>--notify</string>
+    <string>__SKETCHYBAR__ --trigger headphone_battery_change</string>
   </array>
 
   <key>RunAtLoad</key>
   <true/>
 
-  <key>StartInterval</key>
-  <integer>300</integer>
+  <!-- Restarted if it ever stops, including the deliberate exit on a Bluetooth
+       call that hangs, which is the one failure it cannot recover from itself. -->
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
 
   <key>ProcessType</key>
   <string>Background</string>

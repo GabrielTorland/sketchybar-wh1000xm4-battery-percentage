@@ -23,7 +23,11 @@ local config = {
   agent = "io.github.gabrieltorland.headphone-battery",
 
   position = "right",
-  update_freq = 60, -- how often to re-read the file, not the headphones
+  -- Only a backstop. The agent raises an event the moment the reading
+  -- changes, so this is for the slow drift of the level itself.
+  update_freq = 300,
+  -- Raised by the agent, via its --notify argument.
+  event = "headphone_battery_change",
   padding = 5, -- side padding, restored when the item is shown again
 
   -- SF Symbols "headphones". Written as an escape because the glyph itself
@@ -125,16 +129,19 @@ local function read_cache()
   sbar.exec("cat " .. config.cache .. " 2>/dev/null; echo", apply)
 end
 
--- Switching output device is the moment the answer changes, and waiting out
--- the agent's own interval to find out would be a long time to look wrong, so
--- ask it to run now and read the result once it has had time to land.
+-- Switching what you listen through is the moment the answer changes, and the
+-- agent is told that by macOS the instant it happens, so it tells us rather
+-- than us going looking. Nudging it by hand is only worth it when we cannot be
+-- sure it was listening, which is after the machine has been asleep.
 local function refresh()
-  sbar.exec("launchctl kickstart -k gui/$(id -u)/" .. config.agent
+  sbar.exec("launchctl kickstart gui/$(id -u)/" .. config.agent
             .. " >/dev/null 2>&1; sleep 3; cat " .. config.cache .. " 2>/dev/null; echo", apply)
 end
 
+sbar.add("event", config.event)
+
 headphone_battery:subscribe("routine", read_cache)
-headphone_battery:subscribe("volume_change", refresh)
+headphone_battery:subscribe(config.event, read_cache)
 headphone_battery:subscribe("system_woke", refresh)
 
 read_cache()

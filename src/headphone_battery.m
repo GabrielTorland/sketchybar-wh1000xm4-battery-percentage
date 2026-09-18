@@ -329,6 +329,13 @@ static void usage(void) {
         "                        atomically, emptying it when there is nothing\n"
         "                        to report\n"
         "  -v, --verbose         trace the protocol exchange on stderr\n"
+        "  -w, --watch           stay running and re-read whenever the audio\n"
+        "                        output device changes, which is when the\n"
+        "                        answer changes\n"
+        "  -n, --notify <cmd>    in watch mode, run <cmd> after the reading\n"
+        "                        changes, e.g. to nudge a status bar\n"
+        "  -i, --interval <sec>  in watch mode, re-read this often as a\n"
+        "                        backstop (default 300)\n"
         "  -h, --help            show this message\n"
         "\n"
         "exit codes:\n"
@@ -359,11 +366,250 @@ static int WriteAtomically(NSString *path, NSString *contents) {
     return 0;
 }
 
+
+// Nothing to report is reported as emptiness rather than silence, so a reader
+// can tell "not listening through these" from "never ran".
+#define GONE(code) do { if (output) WriteAtomically(output, @""); return (code); } while (0)
+
+// A read that fails while the headset is still the output device is a
+// different thing from the headset being absent: erasing the reading would
+// make the widget flicker away on every transient radio problem.
+#define UNREAD(code) do { \
+    if (output && !FreshReadingExists(output)) WriteAtomically(output, @""); \
+    return (code); \
+} while (0)
+
+// One complete attempt: work out whether there is anything worth reporting,
+// and if so go and ask the headset. Split out of main so that watch mode can
+// repeat it without re-entering the process.
+static int ReadOnce(NSString *wanted, BOOL any, BOOL json,
+                    NSString *output, NSTimeInterval timeout) {
+  @autoreleasepool {
+    // Clear a reading that has aged out before doing anything that might hang,
+    // so that even a permanently unreachable headset stops being reported
+    // rather than freezing at its last known level.
+    if (output && !FreshReadingExists(output)) {
+        struct stat st;
+        if (stat(output.UTF8String, &st) == 0 && st.st_size > 0) WriteAtomically(output, @"");
+    }
+
+    // Generous relative to the run loop deadline: this is the last resort for
+    // a call that never returns, not the normal way to give up. Disarmed on
+    // the way out so that it cannot fire while the watcher sits idle.
+    signal(SIGALRM, OnAlarm);
+    alarm((unsigned)(timeout * 2) + 5);
+
+    // Default behaviour: whatever you are listening through right now.
+    if (!wanted && !any) {
+        wanted = DefaultOutputDeviceName();
+        if (!wanted) { alarm(0); GONE(EXIT_NO_DEVICE); }
+    }
+
+    NSMutableArray<IOBluetoothDevice *> *candidates = [NSMutableArray array];
+    for (IOBluetoothDevice *d in [IOBluetoothDevice pairedDevices]) {
+        if (![d isConnected]) continue;
+        NSString *nm = [d name] ?: @"";
+        if (wanted && [nm rangeOfString:wanted].location == NSNotFound) continue;
+        [candidates addObject:d];
+    }
+    if (candidates.count == 0) { alarm(0); GONE(EXIT_NO_DEVICE); }
+
+    int lastError = EXIT_NO_DEVICE;
+    for (IOBluetoothDevice *dev in candidates) {
+        BluetoothRFCOMMChannelID cid = ControlChannel(dev);
+        if (cid == 0) { lastError = EXIT_NO_SERVICE; continue; }
+
+        MDRClient *client = [[MDRClient alloc] init];
+        IOBluetoothRFCOMMChannel *ch = nil;
+        if (verbose) fprintf(stderr, "opening %s channel %d\n",
+                             ([dev name] ?: @"?").UTF8String, cid);
+        IOReturn rc = [dev openRFCOMMChannelAsync:&ch withChannelID:cid delegate:client];
+        if (verbose) fprintf(stderr, "open call returned: 0x%08X\n", rc);
+        if (rc != kIOReturnSuccess) { lastError = EXIT_NO_CHANNEL; continue; }
+
+        NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:timeout];
+        NSDate *nextRetry = [NSDate dateWithTimeIntervalSinceNow:RETRY_EVERY];
+        while (!client.done && [deadline timeIntervalSinceNow] > 0) {
+            [[NSRunLoop currentRunLoop] runMode:NSDefaultRunLoopMode
+                                     beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.05]];
+            // The handshake reply occasionally gets lost among the headset's
+            // own notifications; asking again is harmless and settles it.
+            if (client.channel && [nextRetry timeIntervalSinceNow] <= 0) {
+                [client requestBattery];
+                nextRetry = [NSDate dateWithTimeIntervalSinceNow:RETRY_EVERY];
+            }
+        }
+        [ch closeChannel];
+
+        if (client.battery < 0) { lastError = EXIT_NO_REPLY; continue; }
+
+        NSString *name = [dev name] ?: @"";
+        NSString *reading = json
+            ? [NSString stringWithFormat:@"{\"device\":\"%@\",\"percent\":%d,\"charging\":%s}\n",
+                                         name, client.battery, client.charging ? "true" : "false"]
+            : [NSString stringWithFormat:@"%d\n", client.battery];
+
+        alarm(0);
+        if (output) {
+            if (WriteAtomically(output, reading) != 0) return EXIT_USAGE;
+        } else {
+            fputs(reading.UTF8String, stdout);
+        }
+        return EXIT_OK;
+    }
+    alarm(0);
+    UNREAD(lastError);
+  }
+}
+
+static int ListDevices(void) {
+    for (IOBluetoothDevice *d in [IOBluetoothDevice pairedDevices]) {
+        if (![d isConnected]) continue;
+        BluetoothRFCOMMChannelID cid = ControlChannel(d);
+        printf("%-28s %s\n", ([d name] ?: @"(unnamed)").UTF8String,
+               cid ? [NSString stringWithFormat:@"control channel %d", cid].UTF8String
+                   : "no control channel");
+    }
+    return EXIT_OK;
+}
+
+
+// Whether there is a connected, matching device that is also what you are
+// listening through. Answering this needs only the list of paired devices, no
+// connection to any of them, so it is safe to ask the instant the route
+// changes and it cannot disturb the headset.
+static BOOL TargetPresent(NSString *wanted, BOOL any) {
+    if (!wanted && !any) {
+        wanted = DefaultOutputDeviceName();
+        if (!wanted) return NO;
+    }
+    for (IOBluetoothDevice *d in [IOBluetoothDevice pairedDevices]) {
+        if (![d isConnected]) continue;
+        NSString *nm = [d name] ?: @"";
+        if (wanted && [nm rangeOfString:wanted].location == NSNotFound) continue;
+        return YES;
+    }
+    return NO;
+}
+
+// The watcher exists because the answer changes the moment you switch what you
+// are listening through, and nothing about polling can be both prompt and
+// cheap. macOS will say so immediately, so the work is done on being told
+// rather than on a timer, and the bar is nudged only when the answer actually
+// changed.
+@interface Watcher : NSObject
+@property (nonatomic, copy) NSString *wanted, *output, *notify;
+@property (nonatomic) BOOL any, json;
+@property (nonatomic) NSTimeInterval timeout, interval;
+@property (nonatomic) BOOL busy;
+@property (nonatomic, strong) NSMutableArray<NSTimer *> *pending;
+@end
+
+@implementation Watcher
+
+- (NSString *)currentReading {
+    if (!self.output) return @"";
+    NSString *c = [NSString stringWithContentsOfFile:self.output
+                                            encoding:NSUTF8StringEncoding error:NULL];
+    return c ?: @"";
+}
+
+- (void)refresh {
+    // A read spins a run loop of its own while it waits, which lets the timers
+    // below fire straight back into here. Two reads at once is not merely
+    // wasteful: the headset serves one control connection at a time, so they
+    // knock each other out and both come back empty handed.
+    if (self.busy) {
+        if (verbose) fprintf(stderr, "refresh: skipped, one already running\n");
+        return;
+    }
+    self.busy = YES;
+
+    NSString *before = [self currentReading];
+    int rc = ReadOnce(self.wanted, self.any, self.json, self.output, self.timeout);
+    NSString *after = [self currentReading];
+    self.busy = NO;
+
+    if (verbose) fprintf(stderr, "refresh: rc=%d %s\n", rc,
+                         [before isEqual:after] ? "(unchanged)" : "(changed)");
+
+    // Once there is a reading the rest of the chasing is pointless. Only a
+    // real reading stops it: a headset that has just become the output device
+    // often reports itself as not there yet, and giving up on that would be
+    // giving up exactly when the retries are the point.
+    if (rc == EXIT_OK) [self cancelPending];
+
+    // Only worth waking anything up if what a reader would see is different.
+    if (![before isEqual:after] && self.notify) system(self.notify.UTF8String);
+}
+
+- (void)cancelPending {
+    for (NSTimer *t in self.pending) [t invalidate];
+    [self.pending removeAllObjects];
+}
+
+// A headset that has just become the output device is often not ready to talk
+// yet: the audio link comes up before the control channel will answer. So a
+// change is chased a few times over the following seconds rather than asked
+// about once and given up on.
+- (void)deviceChanged {
+    [self cancelPending];
+
+    // Losing the headset is known at once and needs nothing from Bluetooth, so
+    // the answer can be put right immediately.
+    if (!TargetPresent(self.wanted, self.any)) {
+        [self refresh];
+        return;
+    }
+
+    // Gaining it is not symmetrical. The headset will not entertain a control
+    // connection while the audio route is still settling, and asking too early
+    // does not simply fail: it wedges the channel, so every later attempt fails
+    // too until the link is torn down. Hence the wait before the first ask.
+    for (NSNumber *delay in @[ @5.0, @12.0, @30.0 ]) {
+        NSTimer *t = [NSTimer scheduledTimerWithTimeInterval:delay.doubleValue
+                                                      target:self
+                                                    selector:@selector(refresh)
+                                                    userInfo:nil
+                                                     repeats:NO];
+        [self.pending addObject:t];
+    }
+}
+
+- (void)start {
+    self.pending = [NSMutableArray array];
+
+    AudioObjectPropertyAddress addr = {
+        kAudioHardwarePropertyDefaultOutputDevice,
+        kAudioObjectPropertyScopeGlobal,
+        kAudioObjectPropertyElementMain
+    };
+    AudioObjectAddPropertyListenerBlock(
+        kAudioObjectSystemObject, &addr, dispatch_get_main_queue(),
+        ^(UInt32 n, const AudioObjectPropertyAddress *a) {
+            (void)n; (void)a;
+            if (verbose) fprintf(stderr, "output device changed\n");
+            [self deviceChanged];
+        });
+
+    // A slow backstop, for the level falling as you listen and for anything the
+    // notification does not cover.
+    [NSTimer scheduledTimerWithTimeInterval:self.interval
+                                     target:self
+                                   selector:@selector(refresh)
+                                   userInfo:nil
+                                    repeats:YES];
+
+    [self refresh];
+    [[NSRunLoop currentRunLoop] run];
+}
+@end
+
 int main(int argc, const char *argv[]) {
     @autoreleasepool {
-        NSString *wanted = nil, *output = nil;
-        BOOL any = NO, json = NO, list = NO;
-        NSTimeInterval timeout = 5.0;
+        NSString *wanted = nil, *output = nil, *notify = nil;
+        BOOL any = NO, json = NO, list = NO, watch = NO;
+        NSTimeInterval timeout = 5.0, interval = 300.0;
 
         for (int i = 1; i < argc; i++) {
             NSString *a = [NSString stringWithUTF8String:argv[i]];
@@ -372,6 +618,7 @@ int main(int argc, const char *argv[]) {
             else if ([a isEqual:@"-j"] || [a isEqual:@"--json"]) json = YES;
             else if ([a isEqual:@"-l"] || [a isEqual:@"--list"]) list = YES;
             else if ([a isEqual:@"-v"] || [a isEqual:@"--verbose"]) verbose = YES;
+            else if ([a isEqual:@"-w"] || [a isEqual:@"--watch"]) watch = YES;
             else if ([a isEqual:@"-d"] || [a isEqual:@"--device"]) {
                 if (++i >= argc) { usage(); return EXIT_USAGE; }
                 wanted = [NSString stringWithUTF8String:argv[i]];
@@ -381,105 +628,26 @@ int main(int argc, const char *argv[]) {
             } else if ([a isEqual:@"-o"] || [a isEqual:@"--output"]) {
                 if (++i >= argc) { usage(); return EXIT_USAGE; }
                 output = [NSString stringWithUTF8String:argv[i]];
+            } else if ([a isEqual:@"-n"] || [a isEqual:@"--notify"]) {
+                if (++i >= argc) { usage(); return EXIT_USAGE; }
+                notify = [NSString stringWithUTF8String:argv[i]];
+            } else if ([a isEqual:@"-i"] || [a isEqual:@"--interval"]) {
+                if (++i >= argc) { usage(); return EXIT_USAGE; }
+                interval = atof(argv[i]);
             } else { usage(); return EXIT_USAGE; }
         }
 
-        // Generous relative to the run loop deadline: this is the last resort
-        // for a call that never returns, not the normal way to give up.
-        // Clear a reading that has aged out before doing anything that might
-        // hang, so that even a permanently unreachable headset stops being
-        // reported rather than freezing at its last known level.
-        if (output && !FreshReadingExists(output)) {
-            struct stat st;
-            if (stat(output.UTF8String, &st) == 0 && st.st_size > 0) WriteAtomically(output, @"");
-        }
-        signal(SIGALRM, OnAlarm);
-        alarm((unsigned)(timeout * 2) + 5);
+        if (list) return ListDevices();
 
-        // Nothing to report is reported as emptiness rather than silence, so a
-        // reader can tell "not listening through these" from "never ran".
-        #define GONE(code) do { if (output) WriteAtomically(output, @""); return (code); } while (0)
-
-        // A read that fails while the headset is still the output device is a
-        // different thing from the headset being absent: erasing the reading
-        // would make the widget flicker away on every transient radio problem.
-        #define UNREAD(code) do { \
-            if (output && !FreshReadingExists(output)) WriteAtomically(output, @""); \
-            return (code); \
-        } while (0)
-
-        if (list) {
-            for (IOBluetoothDevice *d in [IOBluetoothDevice pairedDevices]) {
-                if (![d isConnected]) continue;
-                BluetoothRFCOMMChannelID cid = ControlChannel(d);
-                printf("%-28s %s\n", ([d name] ?: @"(unnamed)").UTF8String,
-                       cid ? [NSString stringWithFormat:@"control channel %d", cid].UTF8String
-                           : "no control channel");
-            }
-            return EXIT_OK;
+        if (watch) {
+            if (interval <= 0) { usage(); return EXIT_USAGE; }
+            Watcher *w = [[Watcher alloc] init];
+            w.wanted = wanted; w.output = output; w.notify = notify;
+            w.any = any; w.json = json; w.timeout = timeout; w.interval = interval;
+            [w start];
+            return EXIT_OK; // not reached
         }
 
-        // Default behaviour: whatever you are listening through right now.
-        if (!wanted && !any) {
-            wanted = DefaultOutputDeviceName();
-            if (!wanted) GONE(EXIT_NO_DEVICE);
-        }
-
-        NSMutableArray<IOBluetoothDevice *> *candidates = [NSMutableArray array];
-        for (IOBluetoothDevice *d in [IOBluetoothDevice pairedDevices]) {
-            if (![d isConnected]) continue;
-            NSString *nm = [d name] ?: @"";
-            if (wanted && [nm rangeOfString:wanted].location == NSNotFound) continue;
-            [candidates addObject:d];
-        }
-        if (candidates.count == 0) GONE(EXIT_NO_DEVICE);
-
-        int lastError = EXIT_NO_DEVICE;
-        for (IOBluetoothDevice *dev in candidates) {
-            BluetoothRFCOMMChannelID cid = ControlChannel(dev);
-            if (cid == 0) { lastError = EXIT_NO_SERVICE; continue; }
-
-            MDRClient *client = [[MDRClient alloc] init];
-            IOBluetoothRFCOMMChannel *ch = nil;
-            if (verbose) fprintf(stderr, "opening %s channel %d\n",
-                                 ([dev name] ?: @"?").UTF8String, cid);
-            IOReturn rc = [dev openRFCOMMChannelAsync:&ch withChannelID:cid delegate:client];
-            if (verbose) fprintf(stderr, "open call returned: 0x%08X\n", rc);
-            if (rc != kIOReturnSuccess) {
-                lastError = EXIT_NO_CHANNEL;
-                continue;
-            }
-
-            NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:timeout];
-            NSDate *nextRetry = [NSDate dateWithTimeIntervalSinceNow:RETRY_EVERY];
-            while (!client.done && [deadline timeIntervalSinceNow] > 0) {
-                [[NSRunLoop currentRunLoop] runMode:NSDefaultRunLoopMode
-                                         beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.05]];
-                // The handshake reply occasionally gets lost among the headset's
-                // own notifications; asking again is harmless and settles it.
-                if (client.channel && [nextRetry timeIntervalSinceNow] <= 0) {
-                    [client requestBattery];
-                    nextRetry = [NSDate dateWithTimeIntervalSinceNow:RETRY_EVERY];
-                }
-            }
-            [ch closeChannel];
-
-            if (client.battery < 0) { lastError = EXIT_NO_REPLY; continue; }
-
-            NSString *name = [dev name] ?: @"";
-            NSString *reading = json
-                ? [NSString stringWithFormat:@"{\"device\":\"%@\",\"percent\":%d,\"charging\":%s}\n",
-                                             name, client.battery, client.charging ? "true" : "false"]
-                : [NSString stringWithFormat:@"%d\n", client.battery];
-
-            if (output) {
-                if (WriteAtomically(output, reading) != 0) return EXIT_USAGE;
-            } else {
-                fputs(reading.UTF8String, stdout);
-            }
-            return EXIT_OK;
-        }
-        UNREAD(lastError);
-        #undef FAIL
+        return ReadOnce(wanted, any, json, output, timeout);
     }
 }

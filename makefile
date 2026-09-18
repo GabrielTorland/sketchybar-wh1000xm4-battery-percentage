@@ -2,6 +2,8 @@ BIN     := headphone-battery
 SRC     := src/headphone_battery.m
 PREFIX  ?= $(HOME)/.local
 CACHE   ?= $(HOME)/.cache/headphone-battery.json
+# Absolute, because launchd agents do not inherit a useful PATH.
+SKETCHYBAR ?= $(shell command -v sketchybar 2>/dev/null || echo /opt/homebrew/bin/sketchybar)
 LABEL   := io.github.gabrieltorland.headphone-battery
 AGENT   := $(HOME)/Library/LaunchAgents/$(LABEL).plist
 
@@ -27,6 +29,7 @@ install-agent: bin/$(BIN)
 	mkdir -p $(PREFIX)/bin $(HOME)/Library/LaunchAgents $(dir $(CACHE))
 	install -m 755 bin/$(BIN) $(PREFIX)/bin/$(BIN)
 	sed -e 's|__PREFIX__|$(PREFIX)|g' -e 's|__CACHE__|$(CACHE)|g' \
+	    -e 's|__SKETCHYBAR__|$(SKETCHYBAR)|g' \
 	    sketchybar/$(LABEL).plist > $(AGENT)
 	-launchctl bootout gui/$(shell id -u)/$(LABEL) 2>/dev/null
 	launchctl bootstrap gui/$(shell id -u) $(AGENT)

@@ -5,11 +5,15 @@
 #     cp headphone_battery.sh ~/.config/sketchybar/plugins/
 #     chmod +x ~/.config/sketchybar/plugins/headphone_battery.sh
 
+# The agent raises this the moment the reading changes, which is what keeps the
+# item from lagging behind the headphones by minutes.
+sketchybar --add event headphone_battery_change
+
 # The icon is the SF Symbols "headphones" glyph, U+100448. It only renders in
 # the system font, so it may look like a blank box in a browser or editor.
 sketchybar --add item headphone_battery right \
            --set headphone_battery \
-                 update_freq=60 \
+                 update_freq=300 \
                  script="$PLUGIN_DIR/headphone_battery.sh" \
                  icon="􀑈" \
                  icon.font="SF Pro:Regular:14.0" \
@@ -21,4 +25,4 @@ sketchybar --add item headphone_battery right \
                  background.color=0xff363944 \
                  background.corner_radius=5 \
                  background.height=24 \
-           --subscribe headphone_battery volume_change system_woke
+           --subscribe headphone_battery headphone_battery_change system_woke

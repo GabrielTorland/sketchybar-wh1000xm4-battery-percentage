@@ -50,8 +50,12 @@ make install
 ```
 
 This builds `headphone-battery` into `~/.local/bin` and installs a launchd agent
-that refreshes the reading every five minutes. Use `PREFIX=/usr/local` to install
-elsewhere, and `make uninstall` to remove everything.
+that keeps the reading up to date. Use `PREFIX=/usr/local` to install elsewhere,
+and `make uninstall` to remove everything.
+
+The agent nudges sketchybar by running `sketchybar --trigger
+headphone_battery_change`. `make install` fills in the path it found; override it
+with `SKETCHYBAR=/path/to/sketchybar` if yours lives somewhere unusual.
 
 Check that it worked:
 
@@ -74,11 +78,32 @@ blocks on Bluetooth, and the widget costs a file read. The file is written
 atomically and emptied whenever the headphones are not what you are listening
 through.
 
+### Why it watches rather than polls
+
+The reading changes when you switch what you are listening through, and macOS
+says so the moment it happens. So the agent runs continuously, listens for
+that, and raises a sketchybar event when the answer actually changed. Polling
+cannot do the same job: an interval short enough to feel immediate would mean
+pestering the headphones constantly, and one long enough to be polite leaves
+the bar wrong for minutes at a time.
+
+Putting the headphones down is reflected within a second, because that needs no
+Bluetooth at all -- only which device macOS is playing through. Picking them up
+again takes a few seconds longer, for the reason in the next paragraph.
+
+Timing matters more than it looks. A headset that has just become the output
+device will not accept a control connection while the audio route is still
+settling, and asking too early does not merely fail: it wedges the control
+channel, so every later attempt fails too until the Bluetooth link is rebuilt.
+The agent therefore waits a few seconds before its first question, and never
+asks two at once, since the headset serves one control connection at a time.
+
 ## sketchybar setup
 
 Both versions read the cache file, show the item only when the headphones are the
-output device, and colour the label as the battery drops. Changing output device
-refreshes the bar within a few seconds instead of waiting out the interval.
+output device, and colour the label as the battery drops. Both listen for the
+`headphone_battery_change` event the agent raises, so the bar follows the
+headphones rather than a timer; the update interval is only a backstop.
 
 ### Lua ([SbarLua](https://github.com/FelixKratz/SbarLua))
 
@@ -129,6 +154,16 @@ second.
 | `-t`, `--timeout <secs>` | Give up after this long (default 5) |
 | `-o`, `--output <path>` | Write the reading to a file atomically |
 | `-v`, `--verbose` | Trace the protocol exchange on stderr |
+| `-w`, `--watch` | Stay running and re-read when the output device changes |
+| `-n`, `--notify <cmd>` | In watch mode, run `<cmd>` when the reading changes |
+| `-i`, `--interval <sec>` | In watch mode, the backstop re-read (default 300) |
+
+Watch mode is how the installed agent runs:
+
+```sh
+headphone-battery --watch --json -o ~/.cache/headphone-battery.json \
+                  --notify 'sketchybar --trigger headphone_battery_change'
+```
 
 Exit codes: `0` success, `1` no matching device, `2` no control channel,
 `3` channel would not open, `4` no reply, `64` usage error.
@@ -211,13 +246,21 @@ succeeding while a read fails is itself a sign of this state.
 **The widget stays empty.** Check the agent and the file it writes:
 
 ```sh
-launchctl print gui/$(id -u)/io.github.gabrieltorland.headphone-battery | grep 'last exit'
+launchctl print gui/$(id -u)/io.github.gabrieltorland.headphone-battery | grep state
 cat ~/.cache/headphone-battery.json
 ```
 
-`last exit code = 1` means the headphones were not the output device when it last
-ran. Force a fresh reading with `launchctl kickstart -k
-gui/$(id -u)/io.github.gabrieltorland.headphone-battery`.
+The agent stays running, so `state = running` is what you want to see. If it is
+not there at all, `make install` again. To watch it work, stop it and run the
+same command by hand:
+
+```sh
+launchctl bootout gui/$(id -u)/io.github.gabrieltorland.headphone-battery
+headphone-battery --watch --json -o ~/.cache/headphone-battery.json --verbose
+```
+
+Then change output device and watch what it decides. `make install` puts it
+back.
 
 An empty file means "nothing to report" and is what makes the widget collapse.
 The file is only emptied when the headphones genuinely are not the output
@@ -225,9 +268,11 @@ device; a failed read leaves the previous reading in place instead, so a brief
 radio problem does not make the widget disappear. A reading that cannot be
 refreshed for 30 minutes is dropped rather than left to go stale.
 
-Note that sketchybar stops updating an item whose `drawing` is `off`, so an item
-that hides itself that way never comes back. Both versions here collapse to
-`width=0` instead, which is invisible but keeps polling.
+**The item never comes back once hidden.** sketchybar stops updating an item
+whose `drawing` is `off`, so an item that hides itself that way is hidden for
+good. Both versions here collapse to `width=0` instead, which is invisible but
+still runs. They also zero the side paddings, because an item of zero width
+still pads itself and will push a surrounding bracket into its neighbour.
 
 **Do not call the binary from a sketchybar script.** It will not work — see
 [above](#why-an-agent-instead-of-a-sketchybar-script).
